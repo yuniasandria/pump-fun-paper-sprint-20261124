@@ -57,11 +57,43 @@ const decided = new Set<string>();
 const entrySlot = new Map<string, number>();
 /** Mints with a sell still in flight. */
 const sellPending = new Set<string>();
+/** Mint -> last priced reserves + value: a position is re-priced only when its curve or the holding moved. */
+const valueCache = new Map<string, { vt: bigint; vq: bigint; tokens: bigint; cost: bigint; value: bigint }>();
+/** Base + priority fee per order, cached on first use: constant for the run. */
+let cachedTxFee: bigint | null = null;
 
 /** Current value of a holding in lamports, from the curve's virtual reserves. */
 function positionValue(curve: Curve, tokenAmount: bigint): bigint {
   if (curve.virtual_token_reserves === 0n) return 0n;
   return (tokenAmount * curve.virtual_quote_reserves) / curve.virtual_token_reserves;
+}
+
+/**
+ * Value of a holding, re-priced only when its curve's reserves or the
+ * holding itself moved. The value is a pure function of (reserves, tokens),
+ * so the cached value decides exactly like a fresh pricing; the time stop
+ * is still checked from the slot on every batch.
+ */
+function cachedValue(mint: string, curve: Curve, tokenAmount: bigint, cost: bigint): bigint {
+  const c = valueCache.get(mint);
+  if (
+    c !== undefined &&
+    c.vt === curve.virtual_token_reserves &&
+    c.vq === curve.virtual_quote_reserves &&
+    c.tokens === tokenAmount &&
+    c.cost === cost
+  ) {
+    return c.value;
+  }
+  const value = positionValue(curve, tokenAmount);
+  valueCache.set(mint, {
+    vt: curve.virtual_token_reserves,
+    vq: curve.virtual_quote_reserves,
+    tokens: tokenAmount,
+    cost,
+    value,
+  });
+  return value;
 }
 
 await runBot({
@@ -77,7 +109,7 @@ await runBot({
     }
 
     const { caps } = state.hello;
-    const txFee = state.txFeeLamports();
+    const txFee = (cachedTxFee ??= state.txFeeLamports());
     const orders: Array<BuyInput | SellInput> = [];
 
     // Exits first: bank the runners, cut the losers, drop the stale ones.
@@ -86,7 +118,7 @@ await runBot({
       if (sellPending.has(mint)) continue;
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
-      const value = positionValue(curve, holding.token_amount);
+      const value = cachedValue(mint, curve, holding.token_amount, holding.cost_lamports);
       const cost = holding.cost_lamports;
       const enteredAt = entrySlot.get(mint);
       const agedOut = enteredAt !== undefined && state.slot - enteredAt >= TIME_STOP_SLOTS;
@@ -103,8 +135,22 @@ await runBot({
     }
 
     // Entries, in the batch's event order, with what the exits left over.
-    let free = state.freeCashLamports();
-    let slots = caps.max_open_positions - state.committedPositionCount();
+    // Free cash without the SDK's per-batch call: cash minus the tx fee and
+    // buy amounts of pending orders — the same formula it computes.
+    let free = state.cash;
+    for (const po of state.pending.values()) {
+      free -= txFee;
+      if (po.order.side === 'buy') free -= BigInt(po.order.quote_lamports);
+    }
+    // Committed positions without the SDK's per-batch Set: the bot never
+    // holds two pending buys on one mint (a candidate is decided once and a
+    // pending mint is skipped), so counting pending buys not already held
+    // equals the distinct-mint count exactly.
+    let committed = state.positions.size;
+    for (const po of state.pending.values()) {
+      if (po.order.side === 'buy' && !state.positions.has(po.order.mint)) committed++;
+    }
+    let slots = caps.max_open_positions - committed;
     for (const event of batch.events) {
       if (event.event === 'CreateEvent') {
         if (!decided.has(event.mint)) candidates.add(event.mint);
@@ -116,6 +162,10 @@ await runBot({
         decided.add(event.mint);
         continue;
       }
+      // The size cap is real_quote_reserves * 100 / 10000, so it reaches
+      // MIN_BUY (0.01 SOL) exactly when the real reserve reaches 1 SOL:
+      // skip the BigInt multiply/divide for every coin still below it.
+      if (curve.real_quote_reserves < LAMPORTS_PER_SOL) continue;
       const cap = state.maxBuyLamports(event.mint);
       if (cap < MIN_BUY_LAMPORTS) continue;
       candidates.delete(event.mint);
